@@ -144,11 +144,21 @@ class SocketService {
             where: { id: tripId },
             data: { status: 'COMPLETED', completedAt: new Date() },
           });
+
+          // ── BUG FIX: Reset driver fully in BOTH DB and Redis ──
+          // Without this, driver stays MATCHED in Redis and never appears
+          // in future findNearbyDrivers searches
           await db.driverProfile.update({
             where: { userId },
             data: { status: 'AVAILABLE', totalTrips: { increment: 1 } },
           });
+
+          // Reset Redis status to AVAILABLE so they show up in future searches
           await setDriverStatus(userId, 'AVAILABLE');
+
+          // ── BUG FIX: Release the driver lock from this trip ──
+          const { releaseDriverLock } = require('./redisService');
+          await releaseDriverLock(userId);
 
           this.notifyUser(trip.riderId, 'trip:completed', {
             tripId,
@@ -164,6 +174,7 @@ class SocketService {
           });
 
           socket.emit('trip:completed_ack', { tripId, totalFare: trip.totalFare });
+          logger.info(`Trip ${tripId} completed by driver ${userId}, driver reset to AVAILABLE`);
         } catch (err) {
           logger.error('Complete trip error:', err);
         }

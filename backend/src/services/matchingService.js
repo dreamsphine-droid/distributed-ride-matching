@@ -70,42 +70,77 @@ async function matchRiderToDriver(rideRequest) {
 
   logger.info(`[Matching] Starting match for trip ${tripId}`);
 
-  // Try initial radius, then fallback
-  for (const radiusKm of [INITIAL_RADIUS_KM, FALLBACK_RADIUS_KM]) {
-    const candidates = await findNearbyDrivers(pickupLat, pickupLng, radiusKm);
+  // ── BUG FIX 1: Verify trip is still in REQUESTED state before matching ──
+  // Trip may have been cancelled while matching was queued
+  const currentTrip = await db.trip.findUnique({ where: { id: tripId } });
+  if (!currentTrip || currentTrip.status !== 'REQUESTED') {
+    logger.warn(`[Matching] Trip ${tripId} is no longer REQUESTED (status: ${currentTrip?.status}), aborting`);
+    return null;
+  }
 
-    if (candidates.length === 0) {
-      logger.info(`[Matching] No drivers found within ${radiusKm}km for trip ${tripId}`);
-      continue;
+  // ── BUG FIX 2: Try progressively larger radii including very large fallback ──
+  // Drivers in a fresh session may not have sent location yet — give them time
+  const radii = [INITIAL_RADIUS_KM, FALLBACK_RADIUS_KM, 25, 50];
+
+  for (const radiusKm of radii) {
+    // Re-check trip is still active before each attempt
+    const tripCheck = await db.trip.findUnique({ where: { id: tripId } });
+    if (!tripCheck || tripCheck.status !== 'REQUESTED') {
+      logger.warn(`[Matching] Trip ${tripId} cancelled during search, aborting`);
+      return null;
     }
+
+    const candidates = await findNearbyDrivers(pickupLat, pickupLng, radiusKm);
+    logger.info(`[Matching] Found ${candidates.length} available drivers within ${radiusKm}km for trip ${tripId}`);
+
+    if (candidates.length === 0) continue;
 
     // Score and sort candidates
     const scored = candidates
       .map(driver => ({ ...driver, score: scoreDriver(driver) }))
       .sort((a, b) => b.score - a.score)
-      .slice(0, 15); // Top 15 candidates
-
-    logger.info(`[Matching] ${scored.length} candidates for trip ${tripId} within ${radiusKm}km`);
+      .slice(0, 15);
 
     // Try to match with top-scored drivers (skip locked ones)
     for (const driver of scored) {
+      // ── BUG FIX 3: Check trip still REQUESTED before each driver attempt ──
+      const stillActive = await db.trip.findUnique({ where: { id: tripId } });
+      if (!stillActive || stillActive.status !== 'REQUESTED') {
+        logger.warn(`[Matching] Trip ${tripId} no longer active, stopping driver loop`);
+        return null;
+      }
+
       const lockAcquired = await acquireDriverLock(driver.driverId, tripId);
       if (!lockAcquired) {
-        logger.debug(`[Matching] Driver ${driver.driverId} already locked`);
+        logger.debug(`[Matching] Driver ${driver.driverId} already locked, skipping`);
         continue;
       }
 
       try {
         // Calculate route details
         const distanceKm = haversineKm(pickupLat, pickupLng, dropoffLat, dropoffLng);
-        const durationMin = distanceKm * 2.5; // Rough estimate
+        const durationMin = distanceKm * 2.5;
         const surgeMultiplier = await getSurgeMultiplier(pickupLat, pickupLng);
         const totalFare = calculateFare(distanceKm, surgeMultiplier);
-        const etaMin = Math.ceil(driver.distanceKm * 2);
+        const etaMin = Math.max(1, Math.ceil(driver.distanceKm * 2));
 
-        // Update trip in database
-        await db.trip.update({
-          where: { id: tripId },
+        // Get driver's full profile from DB for accurate info
+        const driverUser = await db.user.findUnique({
+          where: { id: driver.driverId },
+          include: { driverProfile: true },
+        });
+
+        if (!driverUser) {
+          await releaseDriverLock(driver.driverId);
+          continue;
+        }
+
+        // Update trip in database atomically
+        const updatedTrip = await db.trip.update({
+          where: {
+            id: tripId,
+            status: 'REQUESTED', // ── BUG FIX 4: Only update if still REQUESTED (race condition guard)
+          },
           data: {
             driverId: driver.driverId,
             status: 'MATCHED',
@@ -115,23 +150,34 @@ async function matchRiderToDriver(rideRequest) {
             surgeMultiplier,
             totalFare,
           },
-        });
+        }).catch(() => null); // Returns null if trip was already updated by another process
 
-        // Update driver status
+        if (!updatedTrip) {
+          // Another process already matched this trip
+          await releaseDriverLock(driver.driverId);
+          logger.warn(`[Matching] Trip ${tripId} was already matched by another process`);
+          return null;
+        }
+
+        // Update driver status in DB
         await db.driverProfile.update({
           where: { userId: driver.driverId },
           data: { status: 'MATCHED' },
         });
 
+        // ── BUG FIX 5: Also update Redis driver status so they don't appear in future searches ──
+        const { setDriverStatus } = require('./redisService');
+        await setDriverStatus(driver.driverId, 'MATCHED');
+
         const matchResult = {
           tripId,
           riderId,
           driverId: driver.driverId,
-          driverName: driver.name,
-          driverRating: driver.rating,
-          vehicleModel: driver.vehicleModel,
-          vehiclePlate: driver.vehiclePlate,
-          vehicleColor: driver.vehicleColor,
+          driverName: driverUser.name,
+          driverRating: driverUser.rating,
+          vehicleModel: driverUser.driverProfile?.vehicleModel || driver.vehicleModel,
+          vehiclePlate: driverUser.driverProfile?.vehiclePlate || driver.vehiclePlate,
+          vehicleColor: driverUser.driverProfile?.vehicleColor || driver.vehicleColor,
           driverLat: driver.lat,
           driverLng: driver.lng,
           etaMinutes: etaMin,
@@ -162,25 +208,29 @@ async function matchRiderToDriver(rideRequest) {
           ...matchResult,
         });
 
-        logger.info(`[Matching] ✅ Trip ${tripId} matched with driver ${driver.driverId} (score: ${driver.score.toFixed(3)}, ETA: ${etaMin}min)`);
+        logger.info(`[Matching] ✅ Trip ${tripId} matched with driver ${driver.driverId} (ETA: ${etaMin}min, fare: $${totalFare})`);
         return matchResult;
 
       } catch (err) {
         await releaseDriverLock(driver.driverId);
-        logger.error(`[Matching] Error matching driver ${driver.driverId}:`, err);
-        throw err;
+        logger.error(`[Matching] Error matching driver ${driver.driverId}:`, err.message);
+        // Don't throw — try next driver instead
+        continue;
       }
     }
   }
 
-  // No match found — notify rider
-  logger.warn(`[Matching] ❌ No match found for trip ${tripId}`);
-  await db.trip.update({
-    where: { id: tripId },
-    data: { status: 'CANCELLED', cancelReason: 'No drivers available', cancelledAt: new Date() },
-  });
+  // No match found after all radii — check trip still exists before cancelling
+  const finalCheck = await db.trip.findUnique({ where: { id: tripId } });
+  if (finalCheck && finalCheck.status === 'REQUESTED') {
+    logger.warn(`[Matching] ❌ No match found for trip ${tripId} after all attempts`);
+    await db.trip.update({
+      where: { id: tripId },
+      data: { status: 'CANCELLED', cancelReason: 'No drivers available', cancelledAt: new Date() },
+    });
+    socketService?.notifyUser(riderId, 'trip:no_drivers', { tripId });
+  }
 
-  socketService?.notifyUser(riderId, 'trip:no_drivers', { tripId });
   return null;
 }
 

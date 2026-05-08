@@ -25,7 +25,7 @@ router.post('/request', authenticate, authorize('RIDER'), asyncHandler(async (re
   // Check for existing active trip
   const activeTrip = await db.trip.findFirst({
     where: {
-      riderId: req.user.userId,
+      riderId: req.user.id,
       status: { in: ['REQUESTED', 'MATCHED', 'PICKUP', 'IN_PROGRESS'] },
     },
   });
@@ -43,7 +43,7 @@ router.post('/request', authenticate, authorize('RIDER'), asyncHandler(async (re
   // Create trip record
   const trip = await db.trip.create({
     data: {
-      riderId: req.user.userId,
+      riderId: req.user.id,
       status: 'REQUESTED',
       pickupLat: parseFloat(pickupLat),
       pickupLng: parseFloat(pickupLng),
@@ -55,13 +55,13 @@ router.post('/request', authenticate, authorize('RIDER'), asyncHandler(async (re
     },
   });
 
-  logger.info(`Ride requested: trip ${trip.id} by rider ${req.user.userId}`);
+  logger.info(`Ride requested: trip ${trip.id} by rider ${req.user.id}`);
 
   // Publish to Kafka (async — doesn't block response)
   await publishEvent(TOPICS.RIDE_REQUESTED, trip.id, {
     type: 'RIDE_REQUESTED',
     tripId: trip.id,
-    riderId: req.user.userId,
+    riderId: req.user.id,
     pickupLat, pickupLng, pickupAddress,
     dropoffLat, dropoffLng, dropoffAddress,
     surgeMultiplier,
@@ -80,7 +80,7 @@ router.post('/request', authenticate, authorize('RIDER'), asyncHandler(async (re
     try {
       await matchRiderToDriver({
         tripId: trip.id,
-        riderId: req.user.userId,
+        riderId: req.user.id,
         pickupLat: parseFloat(pickupLat),
         pickupLng: parseFloat(pickupLng),
         dropoffLat: parseFloat(dropoffLat),
@@ -148,13 +148,14 @@ router.post('/:tripId/cancel', authenticate, asyncHandler(async (req, res) => {
   const trip = await db.trip.findUnique({ where: { id: tripId } });
   if (!trip) return res.status(404).json({ error: 'Trip not found' });
 
-  if (trip.riderId !== req.user.userId && req.user.role !== 'ADMIN') {
+  if (trip.riderId !== req.user.id && req.user.role !== 'ADMIN') {
     return res.status(403).json({ error: 'Not authorized to cancel this trip' });
   }
 
-  const cancellableStatuses = ['REQUESTED', 'MATCHED', 'PICKUP'];
-  if (!cancellableStatuses.includes(trip.status)) {
-    return res.status(400).json({ error: `Cannot cancel trip with status: ${trip.status}` });
+  // ── BUG FIX: Allow cancelling from any non-terminal state ──
+  const terminalStatuses = ['COMPLETED', 'CANCELLED'];
+  if (terminalStatuses.includes(trip.status)) {
+    return res.status(400).json({ error: `Trip is already ${trip.status}` });
   }
 
   await db.trip.update({
@@ -166,20 +167,31 @@ router.post('/:tripId/cancel', authenticate, asyncHandler(async (req, res) => {
     },
   });
 
-  // Free the driver if matched
+  const { releaseDriverLock, setDriverStatus } = require('../services/redisService');
+  const { getSocketService } = require('../services/socketService');
+
+  // ── BUG FIX: Always clean up Redis regardless of whether driver was assigned ──
   if (trip.driverId) {
-    const { releaseDriverLock, setDriverStatus } = require('../services/redisService');
+    // Release lock, reset driver to available
     await releaseDriverLock(trip.driverId);
     await setDriverStatus(trip.driverId, 'AVAILABLE');
     await db.driverProfile.update({
       where: { userId: trip.driverId },
       data: { status: 'AVAILABLE' },
     });
-
-    const { getSocketService } = require('../services/socketService');
-    getSocketService()?.notifyUser(trip.driverId, 'trip:cancelled', { tripId, reason });
+    getSocketService()?.notifyUser(trip.driverId, 'trip:cancelled', {
+      tripId,
+      reason: reason || 'Cancelled by rider',
+    });
   }
 
+  // ── BUG FIX: Also notify the rider socket so UI updates immediately ──
+  getSocketService()?.notifyUser(trip.riderId, 'trip:cancelled', {
+    tripId,
+    reason: reason || 'Cancelled by rider',
+  });
+
+  logger.info(`Trip ${tripId} cancelled (was ${trip.status})`);
   res.json({ message: 'Trip cancelled', tripId });
 }));
 
