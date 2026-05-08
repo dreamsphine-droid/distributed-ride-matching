@@ -1,0 +1,135 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  RIDER
+  DRIVER
+  ADMIN
+}
+
+enum TripStatus {
+  REQUESTED
+  MATCHED
+  PICKUP
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum DriverStatus {
+  OFFLINE
+  AVAILABLE
+  MATCHED
+  ON_TRIP
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  phone        String?
+  role         UserRole @default(RIDER)
+  rating       Float    @default(5.0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Relations
+  driverProfile DriverProfile?
+  riderTrips    Trip[]         @relation("RiderTrips")
+  driverTrips   Trip[]         @relation("DriverTrips")
+  riderRequests RideRequest[]  @relation("RiderRequests")
+}
+
+model DriverProfile {
+  id             String       @id @default(uuid())
+  userId         String       @unique
+  user           User         @relation(fields: [userId], references: [id])
+  vehicleModel   String
+  vehiclePlate   String
+  vehicleColor   String
+  status         DriverStatus @default(OFFLINE)
+  currentLat     Float?
+  currentLng     Float?
+  geohash        String?
+  totalTrips     Int          @default(0)
+  acceptanceRate Float        @default(1.0)
+  lastPingAt     DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+model Trip {
+  id              String     @id @default(uuid())
+  riderId         String
+  rider           User       @relation("RiderTrips", fields: [riderId], references: [id])
+  driverId        String?
+  driver          User?      @relation("DriverTrips", fields: [driverId], references: [id])
+  status          TripStatus @default(REQUESTED)
+  pickupLat       Float
+  pickupLng       Float
+  pickupAddress   String
+  dropoffLat      Float
+  dropoffLng      Float
+  dropoffAddress  String
+  distanceKm      Float?
+  durationMin     Float?
+  baseFare        Float?
+  surgeMultiplier Float      @default(1.0)
+  totalFare       Float?
+  requestedAt     DateTime   @default(now())
+  matchedAt       DateTime?
+  pickedUpAt      DateTime?
+  completedAt     DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+}
+
+model RideRequest {
+  id            String     @id @default(uuid())
+  riderId       String
+  rider         User       @relation("RiderRequests", fields: [riderId], references: [id])
+  pickupLat     Float
+  pickupLng     Float
+  pickupAddress String
+  dropoffLat    Float
+  dropoffLng    Float
+  dropoffAddress String
+  status        String     @default("PENDING")
+  tripId        String?
+  createdAt     DateTime   @default(now())
+  expiresAt     DateTime
+}
+
+model LocationHistory {
+  id        String   @id @default(uuid())
+  driverId  String
+  lat       Float
+  lng       Float
+  geohash   String
+  speed     Float?
+  heading   Float?
+  timestamp DateTime @default(now())
+
+  @@index([driverId, timestamp])
+  @@index([geohash])
+}
+
+model SurgeZone {
+  id              String   @id @default(uuid())
+  geohash         String   @unique
+  demandCount     Int      @default(0)
+  supplyCount     Int      @default(0)
+  surgeMultiplier Float    @default(1.0)
+  updatedAt       DateTime @updatedAt
+}
