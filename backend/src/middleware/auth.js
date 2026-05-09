@@ -12,7 +12,13 @@ function authenticate(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+    // ── BUG FIX: Token stores 'userId' but all routes used 'req.user.id'
+    // Normalize so both req.user.id AND req.user.userId work everywhere
+    req.user = {
+      ...decoded,
+      id: decoded.userId,       // fix: map userId → id
+      userId: decoded.userId,   // keep original too
+    };
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired token' });

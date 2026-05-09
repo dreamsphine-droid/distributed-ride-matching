@@ -14,26 +14,37 @@ const { errorHandler } = require('./middleware/errorHandler');
 
 const app = express();
 
+// ── BUG FIX: Trust Render/Vercel proxy so rate-limit and IP work correctly
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+app.set('trust proxy', 1);
+
 // ─── Security Middleware ───────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: [
+    process.env.FRONTEND_URL || 'http://localhost:5173',
+    'http://localhost:5173',
+    /\.vercel\.app$/,   // allow all vercel preview URLs too
+  ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
 }));
 
 // ─── Rate Limiting ────────────────────────────────────────────
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 100,
+  windowMs: 60 * 1000,
+  max: 200,            // raised from 100 — Render proxy causes all requests to share one IP
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: 'Too many requests, please slow down.' },
 });
 app.use('/api/', limiter);
 
-// Stricter limit for ride requests (10/min per rider)
 const rideLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 10,
+  max: 20,             // raised from 10 for testing
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { error: 'Too many ride requests. Please wait.' },
 });
 
